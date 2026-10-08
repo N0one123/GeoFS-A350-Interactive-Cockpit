@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GeoFS A350 v4.0 Systems Enhancement
 // @namespace    geofs-a350-v4
-// @version      4.0.0-alpha.3
+// @version      4.0.0-alpha.2
 // @description  Interconnected A350 cockpit interaction and systems layer for GeoFS.
 // @match        https://www.geo-fs.com/geofs.php*
 // @run-at       document-end
@@ -29,7 +29,7 @@
      */
 
     const CFG = Object.freeze({
-        VERSION: '4.0.0-alpha.3',
+        VERSION: '4.0.0-alpha.2',
         POLL: 500,
         STEP: 0.05,
         MASTER_PRIORITY: 5000,
@@ -284,6 +284,83 @@
         return true;
     }
 
+
+    /* -------------------- 3D cockpit anchoring -------------------- */
+
+    function scene() {
+        return window.geofs?.api?.viewer?.scene || null;
+    }
+
+    function aircraftModel() {
+        return ac()?.object3d?.model?._model ||
+            ac()?.definition?.parts?.root?.['3dmodel']?._model ||
+            null;
+    }
+
+    function captureHotspotAnchor(h) {
+        if (h.anchorLocal || h.anchorWorld) return true;
+        const s = scene(), model = aircraftModel(), C = window.Cesium;
+        if (!s?.pickPosition || !model?.modelMatrix || !C?.Cartesian2 || !C?.Matrix4) return false;
+
+        const x = innerWidth * ((h.x + h.w * 0.5) / 100);
+        const y = innerHeight * ((h.y + h.h * 0.5) / 100);
+
+        try {
+            const world = s.pickPosition(new C.Cartesian2(x, y));
+            if (!world) return false;
+
+            const inv = C.Matrix4.inverseTransformation(model.modelMatrix, new C.Matrix4());
+            h.anchorLocal = C.Matrix4.multiplyByPoint(inv, world, new C.Cartesian3());
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function projectHotspot(h) {
+        const s = scene(), model = aircraftModel(), C = window.Cesium;
+        if (!s || !model || !C || !h.anchorLocal) return null;
+
+        try {
+            const world = C.Matrix4.multiplyByPoint(
+                model.modelMatrix,
+                h.anchorLocal,
+                new C.Cartesian3()
+            );
+            const p = typeof s.cartesianToCanvasCoordinates === 'function'
+                ? s.cartesianToCanvasCoordinates(world)
+                : C.SceneTransforms?.worldToWindowCoordinates?.(s, world);
+
+            if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) return null;
+            return { x: p.x, y: p.y };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function updateHotspotProjection() {
+        if (!overlay) return;
+
+        for (const h of hotspots) {
+            const el = overlay.querySelector(`.a350-v4-hotspot[data-id="${CSS.escape(h.id)}"]`);
+            if (!el) continue;
+
+            if (!h.anchorLocal) captureHotspotAnchor(h);
+            const p = projectHotspot(h);
+
+            if (!p) {
+                el.style.display = 'none';
+                continue;
+            }
+
+            el.style.display = '';
+            const w = parseFloat(el.dataset.w || '24');
+            const height = parseFloat(el.dataset.h || '24');
+            el.style.left = Math.round(p.x - w / 2) + 'px';
+            el.style.top = Math.round(p.y - height / 2) + 'px';
+        }
+    }
+
     /* -------------------- camera-safe interaction -------------------- */
 
     function priority() { return performance.now() < input.priorityUntil; }
@@ -442,7 +519,7 @@
 
     function saveMap() {
         const clean = hotspots.map(h => {
-            const o = {...h}; delete o.action; delete o.get; delete o.set; return o;
+            const o = {...h}; delete o.action; delete o.get; delete o.set; delete o.anchorLocal; delete o.anchorWorld; return o;
         });
         localStorage.setItem(CFG.MAP_KEY, JSON.stringify(clean));
     }
@@ -451,22 +528,25 @@
         if (!overlay) return;
         overlay.innerHTML = '';
 
-        // The old alpha used percentage-sized rectangles directly. They were
-        // effectively giant flexible UI blocks. Geometry is now resolved to
-        // concrete screen pixels, so every control has an actual hitbox.
+        // The old alpha used viewport-relative positions, which made controls
+        // stay glued to the camera. Hitboxes now use 3D cockpit anchors and
+        // are projected back onto the screen each frame.
         for (const h of hotspots) {
             const el = document.createElement('div');
             el.className = 'a350-v4-hotspot' + (debug ? ' debug' : '');
             el.dataset.id = h.id;
             el.title = h.name;
 
-            const x = innerWidth * (h.x / 100);
-            const y = innerHeight * (h.y / 100);
             const w = Math.max(12, innerWidth * (h.w / 100));
             const height = Math.max(12, innerHeight * (h.h / 100));
 
-            el.style.left = Math.round(x) + 'px';
-            el.style.top = Math.round(y) + 'px';
+            // Initial size only. Position is projected from the cockpit's
+            // 3D world/local anchor every frame, so the hitbox follows the
+            // actual aircraft instead of staying glued to the viewport.
+            el.dataset.w = String(w);
+            el.dataset.h = String(height);
+            el.style.left = '0px';
+            el.style.top = '0px';
             el.style.width = Math.round(w) + 'px';
             el.style.height = Math.round(height) + 'px';
             overlay.appendChild(el);
@@ -534,6 +614,7 @@
         if (a350) {
             ensureUI();
             step(dt);
+            updateHotspotProjection();
             render();
         }
         else if (overlay) overlay.style.display='none';
