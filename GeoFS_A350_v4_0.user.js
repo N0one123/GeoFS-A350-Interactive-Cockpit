@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GeoFS A350 v4.0 Systems Enhancement
 // @namespace    geofs-a350-v4
-// @version      4.0.0-alpha.2
+// @version      4.0.0-alpha.3
 // @description  Interconnected A350 cockpit interaction and systems layer for GeoFS.
 // @match        https://www.geo-fs.com/geofs.php*
 // @run-at       document-end
@@ -29,7 +29,7 @@
      */
 
     const CFG = Object.freeze({
-        VERSION: '4.0.0-alpha.2',
+        VERSION: '4.0.0-alpha.3',
         POLL: 500,
         STEP: 0.05,
         MASTER_PRIORITY: 5000,
@@ -87,6 +87,7 @@
         lastX: 0,
         masterLock: false,
         priorityUntil: 0,
+        priorityLock: false,
         autoLock: false
     };
 
@@ -287,58 +288,89 @@
 
     function priority() { return performance.now() < input.priorityUntil; }
 
+    function cameraLocked() {
+        // The 5-second priority window freezes the state that existed when
+        // Shift+\\ was pressed. This is important when pressing it again:
+        // FREE must remain FREE during its priority window.
+        if (priority()) return input.priorityLock;
+        return input.masterLock || input.autoLock;
+    }
+
     function applyInputState() {
         input.autoLock = Boolean(input.hover || input.active);
-        // Master state always wins while its 5-second priority window is active;
-        // after that, the persistent master state still remains authoritative.
-        return input.masterLock || input.autoLock;
+        return cameraLocked();
     }
 
     function toggleMasterLock() {
         input.masterLock = !input.masterLock;
+        input.priorityLock = input.masterLock;
         input.priorityUntil = performance.now() + CFG.MASTER_PRIORITY;
+        input.hover = null;
+        input.active = null;
+        applyInputState();
         render();
     }
 
     function eventHitsHotspot(x, y) {
         if (!overlay) return null;
-        const r = overlay.getBoundingClientRect();
-        const px = x / innerWidth * 100;
-        const py = y / innerHeight * 100;
-        return hotspots.find(h => px >= h.x && px <= h.x + h.w &&
-            py >= h.y && py <= h.y + h.h) || null;
+
+        // Prefer the actual rendered hotspot element. This avoids a second,
+        // slightly different coordinate system from the visible hitbox.
+        const el = document.elementFromPoint(x, y);
+        if (el?.classList?.contains('a350-v4-hotspot')) {
+            return hotspots.find(h => h.id === el.dataset.id) || null;
+        }
+
+        // Fallback for browsers where elementFromPoint returns a child.
+        const hit = el?.closest?.('.a350-v4-hotspot');
+        if (hit) return hotspots.find(h => h.id === hit.dataset.id) || null;
+
+        return null;
     }
 
     function onMouseMove(e) {
         if (!isA350(geofsAircraft)) return;
+
         input.hover = eventHitsHotspot(e.clientX, e.clientY);
+        const h = input.active;
+
+        if (h?.type === 'knob') {
+            // Once a knob drag starts, GeoFS must not receive this movement.
+            e.preventDefault();
+            e.stopImmediatePropagation();
+
+            const dx = e.clientX - input.lastX;
+            input.lastX = e.clientX;
+            if (!dx || typeof h.get !== 'function' || typeof h.set !== 'function') return;
+
+            let value = h.get() + (dx / CFG.KNOB_PX) * h.step;
+            if (h.wrap) {
+                const span = h.max - h.min + h.step;
+                while (value < h.min) value += span;
+                while (value > h.max) value -= span;
+            } else value = clamp(value, h.min, h.max);
+            h.set(value);
+            applyInputState();
+            return;
+        }
+
         applyInputState();
 
-        const h = input.active;
-        if (!h || h.type !== 'knob') return;
-        e.preventDefault();
-        e.stopPropagation();
-
-        const dx = e.clientX - input.lastX;
-        input.lastX = e.clientX;
-        if (!dx || typeof h.get !== 'function' || typeof h.set !== 'function') return;
-
-        let value = h.get() + (dx / CFG.KNOB_PX) * h.step;
-        if (h.wrap) {
-            const span = h.max - h.min + h.step;
-            while (value < h.min) value += span;
-            while (value > h.max) value -= span;
-        } else value = clamp(value, h.min, h.max);
-        h.set(value);
+        // Persistent MASTER LOCK blocks GeoFS camera movement everywhere.
+        // A FREE priority window deliberately does NOT enter this branch.
+        if (cameraLocked()) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+        }
     }
 
     function onMouseDown(e) {
         if (!isA350(geofsAircraft)) return;
         const h = eventHitsHotspot(e.clientX, e.clientY);
         if (!h) {
-            if (input.masterLock || priority()) {
+            if (cameraLocked()) {
                 e.preventDefault();
-                e.stopPropagation();
+                e.stopImmediatePropagation();
             }
             return;
         }
@@ -346,14 +378,14 @@
         input.active = h;
         input.lastX = e.clientX;
         e.preventDefault();
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         if (h.type === 'switch' || h.type === 'button') h.action?.();
     }
 
     function onMouseUp(e) {
         if (input.active) {
             e.preventDefault();
-            e.stopPropagation();
+            e.stopImmediatePropagation();
         }
         input.active = null;
         applyInputState();
@@ -418,15 +450,30 @@
     function renderHotspots() {
         if (!overlay) return;
         overlay.innerHTML = '';
+
+        // The old alpha used percentage-sized rectangles directly. They were
+        // effectively giant flexible UI blocks. Geometry is now resolved to
+        // concrete screen pixels, so every control has an actual hitbox.
         for (const h of hotspots) {
             const el = document.createElement('div');
             el.className = 'a350-v4-hotspot' + (debug ? ' debug' : '');
-            el.style.left = h.x + '%'; el.style.top = h.y + '%';
-            el.style.width = h.w + '%'; el.style.height = h.h + '%';
+            el.dataset.id = h.id;
             el.title = h.name;
+
+            const x = innerWidth * (h.x / 100);
+            const y = innerHeight * (h.y / 100);
+            const w = Math.max(12, innerWidth * (h.w / 100));
+            const height = Math.max(12, innerHeight * (h.h / 100));
+
+            el.style.left = Math.round(x) + 'px';
+            el.style.top = Math.round(y) + 'px';
+            el.style.width = Math.round(w) + 'px';
+            el.style.height = Math.round(height) + 'px';
             overlay.appendChild(el);
         }
     }
+
+    let uiReady = false;
 
     function ensureUI() {
         if (!document.getElementById('a350-v4-style')) {
@@ -452,7 +499,10 @@
             panel.querySelector('#a350-v4-parts').onclick=listParts;
             panel.querySelector('#a350-v4-save').onclick=saveMap;
         }
-        renderHotspots();
+        if (!uiReady) {
+            renderHotspots();
+            uiReady = true;
+        }
     }
 
     function togglePanel() { ensureUI(); panel.style.display = panel.style.display === 'none' ? '' : 'none'; }
@@ -460,7 +510,9 @@
     function render() {
         if (!status) return;
         const e=state.electrical,a=state.apu,f=state.fuel,h=state.hydraulic;
-        const lock=input.masterLock?'MASTER LOCK':(input.autoLock?'AUTO LOCK':'FREE');
+        const lock = priority()
+            ? (input.priorityLock ? 'MASTER LOCK' : 'FREE')
+            : (input.masterLock ? 'MASTER LOCK' : (input.autoLock ? 'AUTO LOCK' : 'FREE'));
         status.innerHTML = `<hr style="border:0;border-top:1px solid #26343c">
 <div>Camera: <b>${lock}</b>${priority()?' <span style="color:#ffd76b">PRIORITY</span>':''}</div>
 <div>BAT: ${e.bat1?'ON':'OFF'} ${e.bat1V.toFixed(1)}V / ${e.bat2?'ON':'OFF'} ${e.bat2V.toFixed(1)}V</div>
@@ -479,10 +531,16 @@
         const dt=clamp((now-last)/1000,0,0.2);
         geofsAircraft=ac();
         const a350=isA350(geofsAircraft);
-        if (a350) { ensureUI(); step(dt); render(); }
+        if (a350) {
+            ensureUI();
+            step(dt);
+            render();
+        }
         else if (overlay) overlay.style.display='none';
         if (overlay && a350) overlay.style.display='';
-        if (!input.active && !input.masterLock && !priority()) input.autoLock=Boolean(input.hover);
+        if (!input.active && !input.masterLock && !priority()) {
+            input.autoLock = Boolean(input.hover);
+        }
         requestAnimationFrame(()=>loop(now));
     }
 
@@ -510,7 +568,13 @@
         listParts,
         addPartRotation,
         setPartRotation,
-        camera:{toggle:toggleMasterLock,get locked(){return input.masterLock}},
+        camera:{
+            toggle:toggleMasterLock,
+            get locked(){return cameraLocked()},
+            get masterLocked(){return input.masterLock},
+            get priority(){return priority()},
+            get priorityMode(){return input.priorityLock ? 'MASTER' : 'FREE'}
+        },
         calibrate(name,type='switch',w=3,h=4){
             const x=clamp((input.hover?0:0),0,100); // calibration API placeholder; mapper is next build stage
             console.log('[A350 v4] Use the current pointer position with this helper in the next mapper build:',name,type,w,h,x);
