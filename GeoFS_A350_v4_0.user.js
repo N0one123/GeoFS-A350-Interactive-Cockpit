@@ -92,6 +92,7 @@
     };
 
     let geofsAircraft = null;
+    let lastAircraftModel = null;
     let overlay = null;
     let panel = null;
     let status = null;
@@ -123,10 +124,15 @@
     function updateFuel(dt) {
         const f = state.fuel;
         const pumps = f.left1 || f.left2 || f.center1 || f.center2 || f.right1 || f.right2;
+        const apuFeed = state.apu.master && f.left + f.center + f.right > 1;
         const demand = Number(state.engines[1].running) + Number(state.engines[2].running) +
             Number(state.apu.running) * 0.25;
 
-        f.pressure = approach(f.pressure, pumps ? 1 : 0, 5, dt);
+        // APU fuel feed is independent of the engine pump pressure loop.
+        // This avoids the startup deadlock where the APU needs fuel pressure
+        // before it can start, while still allowing the main pumps to feed engines.
+        const pressureSource = pumps || apuFeed;
+        f.pressure = approach(f.pressure, pressureSource ? 1 : 0, 5, dt);
 
         if (f.center > 0 && (f.center1 || f.center2)) {
             const transfer = Math.min(f.center, 0.15 * dt);
@@ -143,7 +149,7 @@
     function updateAPU(dt) {
         const a = state.apu, e = state.electrical, f = state.fuel;
         const electrical = e.dcEssential;
-        const fuel = f.pressure > 0.15 && (f.left + f.center + f.right > 1);
+        const fuel = f.left + f.center + f.right > 1;
         const requested = a.master && a.start;
 
         if (requested && electrical && fuel && !a.fault) a.rpm = approach(a.rpm, 100, 0.9, dt);
@@ -327,6 +333,23 @@
                 h.anchorLocal,
                 new C.Cartesian3()
             );
+
+            // Prefer GeoFS's own active-camera projection when available.
+            if (typeof window.geofs?.api?.getScreenCoordFromLla === 'function') {
+                const cartographic = C.Cartographic.fromCartesian(world);
+                if (cartographic) {
+                    const lla = [
+                        C.Math.toDegrees(cartographic.longitude),
+                        C.Math.toDegrees(cartographic.latitude),
+                        cartographic.height
+                    ];
+                    const p = window.geofs.api.getScreenCoordFromLla(lla);
+                    if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) {
+                        return {x:p.x, y:p.y};
+                    }
+                }
+            }
+
             const p = typeof s.cartesianToCanvasCoordinates === 'function'
                 ? s.cartesianToCanvasCoordinates(world)
                 : C.SceneTransforms?.worldToWindowCoordinates?.(s, world);
@@ -496,6 +519,8 @@
         { id:'apu-master', name:'APU MASTER', type:'switch', x:18, y:10, w:4, h:5, action:()=>togglePath('apu.master') },
         { id:'apu-start', name:'APU START', type:'switch', x:23, y:10, w:4, h:5, action:()=>togglePath('apu.start') },
         { id:'apu-bleed', name:'APU BLEED', type:'switch', x:28, y:10, w:4, h:5, action:()=>togglePath('pneumatic.apuBleed') },
+        { id:'fuel-left1', name:'FUEL L PUMP 1', type:'switch', x:33, y:10, w:4, h:5, action:()=>togglePath('fuel.left1') },
+        { id:'fuel-right1', name:'FUEL R PUMP 1', type:'switch', x:38, y:10, w:4, h:5, action:()=>togglePath('fuel.right1') },
         { id:'eng1-master', name:'ENG 1 MASTER', type:'switch', x:10, y:25, w:4, h:5, action:()=>togglePath('engines.1.master') },
         { id:'eng1-start', name:'ENG 1 START', type:'switch', x:15, y:25, w:4, h:5, action:()=>togglePath('engines.1.start') },
         { id:'eng2-master', name:'ENG 2 MASTER', type:'switch', x:20, y:25, w:4, h:5, action:()=>togglePath('engines.2.master') },
@@ -598,6 +623,7 @@
 <div>BAT: ${e.bat1?'ON':'OFF'} ${e.bat1V.toFixed(1)}V / ${e.bat2?'ON':'OFF'} ${e.bat2V.toFixed(1)}V</div>
 <div>AC: ${e.acEssential?'POWERED':'OFF'} · DC: ${e.dcEssential?'POWERED':'OFF'}</div>
 <div>APU: ${a.rpm.toFixed(0)}% ${a.running?'RUNNING':'OFF/STARTING'}</div>
+<div>START: BAT 1/2 → APU MASTER → APU START</div>
 <div>ENG1: N2 ${state.engines[1].n2.toFixed(0)} ${state.engines[1].running?'RUN':''}</div>
 <div>ENG2: N2 ${state.engines[2].n2.toFixed(0)} ${state.engines[2].running?'RUN':''}</div>
 <div>FUEL: L ${f.left.toFixed(1)} C ${f.center.toFixed(1)} R ${f.right.toFixed(1)}</div>
@@ -613,6 +639,14 @@
         const a350=isA350(geofsAircraft);
         if (a350) {
             ensureUI();
+            const model = aircraftModel();
+            if (model !== lastAircraftModel) {
+                lastAircraftModel = model;
+                for (const h of hotspots) {
+                    delete h.anchorLocal;
+                    delete h.anchorWorld;
+                }
+            }
             step(dt);
             updateHotspotProjection();
             render();
